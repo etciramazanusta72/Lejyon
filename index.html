@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Kripto Replay & Live($) Full</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://unpkg.com/lightweight-charts@4.0.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  body { margin:0; background:#0e0e0e; color:#d1d4dc; font-family: sans-serif; }
+  #controls { display:flex; justify-content:space-between; padding:5px; background:#1b1b1b; }
+  #chart { width:100%; height:500px; }
+  #tooltip { position:absolute; background:#222; color:#fff; padding:5px; border-radius:3px; font-size:12px; pointer-events:none; }
+  .up { color:#2EBD85; } .down { color:#ef5350; }
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <div class="left-controls">
+    <select id="symbolSelect" onchange="changeSymbol(this.value)">
+      <option value="BTCUSDT">BTC/USDT</option>
+      <option value="ETHUSDT">ETH/USDT</option>
+      <option value="BNBUSDT">BNB/USDT</option>
+    </select>
+
+    <select id="intervalSelect" onchange="changeInterval(this.value)">
+      <option value="1m">1m</option>
+      <option value="5m">5m</option>
+      <option value="15m" selected>15m</option>
+      <option value="1h">1h</option>
+      <option value="4h">4h</option>
+    </select>
+
+    <button onclick="toggleTheme()">🌙 / ☀️</button>
+  </div>
+
+  <div class="right-controls">
+    <label>Strateji:
+      <select id="strategySelect">
+        <option value="strategy1">Strateji 1</option>
+        <option value="strategy2">Strateji 2</option>
+      </select>
+    </label>
+    <button onclick="runSelectedStrategy()">▶ Çalıştır</button>
+
+    <label>EMA:
+      <select id="emaSelect" onchange="updateEMA(this.value)">
+        <option value="none">None</option>
+        <option value="9">9</option>
+        <option value="20" selected>20</option>
+        <option value="50">50</option>
+      </select>
+    </label>
+
+    <label>SMA:
+      <select id="smaSelect" onchange="updateSMA(this.value)">
+        <option value="none">None</option>
+        <option value="9">9</option>
+        <option value="20">20</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+      </select>
+    </label>
+
+    <label>Hız:
+      <select id="replaySpeed" onchange="updateReplaySpeed(this.value)">
+        <option value="1">1x</option>
+        <option value="2">2x</option>
+        <option value="5">5x</option>
+      </select>
+    </label>
+
+    <button onclick="toggleMode()">Replay / Live</button>
+    <span id="modeLabel">Live</span>
+  </div>
+</div>
+
+<div id="chartContainer">
+  <div id="chart"></div>
+  <div id="tooltip"></div>
+</div>
+
+<div id="infoBar">
+  <span id="dateTime">--</span>
+  <span id="lastPrice">Fiyat: --</span>
+  <span id="priceChange">Değişim: --</span>
+</div>
+
+<script>
+/* ===== GLOBALS ===== */
+let chart, candleSeries, emaSeries, smaSeries, socket;
+let currentSymbol = "BTCUSDT";
+let currentInterval = "15m";
+let liveMode = true;
+let replayData = [];
+let replayTimer = null;
+let replaySpeed = 1;
+let emaPeriod = "20";
+let smaPeriod = "50";
+let isLightTheme = false;
+let tickSizes = {};
+let lastEMA = null, lastSMA = null;
+
+/* ===== FETCH TICK SIZES ===== */
+async function fetchTickSizes() {
+  try {
+    const res = await fetch("https://api.binance.com/api/v3/exchangeInfo");
+    const data = await res.json();
+    data.symbols.forEach(s => {
+      const f = s.filters.find(f=>f.filterType==="PRICE_FILTER");
+      if(f) tickSizes[s.symbol]=parseFloat(f.tickSize);
+    });
+  } catch(e){ tickSizes={}; }
+}
+
+/* ===== PRICE FORMAT ===== */
+function formatPrice(symbol, price) {
+  if(!price || !Number.isFinite(price)) return "--";
+  const tick = tickSizes[symbol]||0.01;
+  const decimals = Math.max(0, Math.round(-Math.log10(tick)));
+  return Number(price).toFixed(decimals);
+}
+
+/* ===== EMA / SMA ===== */
+function ema(data, period){
+  if(!data || data.length<period) return [];
+  const k=2/(period+1);
+  const out=[];
+  let sum=0;
+  for(let i=0;i<period;i++) sum+=data[i].close;
+  let prev=sum/period;
+  out.push({time:data[period-1].time,value:prev});
+  for(let i=period;i<data.length;i++){
+    prev=data[i].close*k + prev*(1-k);
+    out.push({time:data[i].time,value:prev});
+  }
+  lastEMA=prev;
+  return out;
+}
+function sma(data, period){
+  if(!data || data.length<period) return [];
+  const out=[];
+  let sum=0;
+  for(let i=0;i<period;i++) sum+=data[i].close;
+  out.push({time:data[period-1].time,value:sum/period});
+  for(let i=period;i<data.length;i++){
+    sum+=data[i].close - data[i-period].close;
+    out.push({time:data[i].time,value:sum/period});
+  }
+  lastSMA=out[out.length-1].value;
+  return out;
+}
+
+/* ===== CHART INIT ===== */
+function initChart(){
+  if(chart) chart.remove();
+  chart = LightweightCharts.createChart(document.getElementById('chart'), {
+    layout:{background:{color:isLightTheme?'#fff':'#0e0e0e'},textColor:isLightTheme?'#000':'#d1d4dc'},
+    grid:{vertLines:{color:'#1e222d'},horzLines:{color:'#1e222d'}},
+    crosshair:{mode: LightweightCharts.CrosshairMode.Normal},
+    rightPriceScale:{borderColor:'#485c7b'},
+    timeScale:{borderColor:'#485c7b'}
+  });
+  candleSeries=chart.addCandlestickSeries({upColor:'#2EBD85',borderUpColor:'#2EBD85',wickUpColor:'#2EBD85',downColor:'#ef5350',borderDownColor:'#ef5350',wickDownColor:'#ef5350'});
+  emaSeries=chart.addLineSeries({color:'#f39c12',lineWidth:1.2});
+  smaSeries=chart.addLineSeries({color:'#00bcd4',lineWidth:1.2});
+  setupTooltip();
+}
+
+/* ===== TOOLTIP ===== */
+function setupTooltip(){
+  const tip=document.getElementById('tooltip');
+  tip.style.display='none';
+  chart.subscribeCrosshairMove(p=>{
+    if(!p||!p.time||!p.point||!p.seriesData){tip.style.display='none';return;}
+    const candle=p.seriesData.get(candleSeries);
+    if(!candle){tip.style.display='none';return;}
+    const date=new Date(p.time*1000);
+    const change=candle.close-candle.open;
+    const pct=candle.open?change/candle.open*100:0;
+    const sign=change>=0?'+':'';
+    tip.innerHTML=`<div>${date.toLocaleString()}</div>
+      <div>O:${formatPrice(currentSymbol,candle.open)}</div>
+      <div>H:${formatPrice(currentSymbol,candle.high)}</div>
+      <div>L:${formatPrice(currentSymbol,candle.low)}</div>
+      <div>C:${formatPrice(currentSymbol,candle.close)}</div>
+      <div class="${change>=0?'up':'down'}">Change:${sign}${formatPrice(currentSymbol,change)} (${sign}${pct.toFixed(2)}%)</div>`;
+    const r=document.getElementById('chart').getBoundingClientRect();
+    let left=r.left+p.point.x+15,top=r.top+p.point.y-tip.offsetHeight-15;
+    if(left+tip.offsetWidth>r.right) left=r.left+p.point.x-tip.offsetWidth-15;
+    if(top<r.top+10) top=r.top+p.point.y+15;
+    tip.style.left=`${left}px`;
+    tip.style.top=`${top}px`;
+    tip.style.display='block';
+  });
+}
+
+/* ===== FETCH HISTORICAL ===== */
+async function fetchHistoricalData(sym,intv){
+  const url=`https://api.binance.com/api/v3/klines?symbol=${sym}&interval=${intv}&limit=500`;
+  const res=await fetch(url);
+  const data=await res.json();
+  return data.map(k=>({time:Math.floor(k[0]/1000),open:+k[1],high:+k[2],low:+k[3],close:+k[4]}));
+}
+
+/* ===== REPLAY ===== */
+async function startReplay(intv){
+  cleanup();
+  liveMode=false;
+  document.getElementById('modeLabel').innerText='Replay';
+  initChart();
+  replayData=await fetchHistoricalData(currentSymbol,intv);
+  if(emaPeriod!=='none') emaSeries.setData(ema(replayData,+emaPeriod));
+  else emaSeries.setData([]);
+  if(smaPeriod!=='none') smaSeries.setData(sma(replayData,+smaPeriod));
+  else smaSeries.setData([]);
+  candleSeries.setData([]);
+  let idx=0;
+  const step=1000/replaySpeed;
+  replayTimer=setInterval(()=>{
+    if(idx<replayData.length){
+      const c=replayData[idx]; candleSeries.update(c); updateInfoBar(c); idx++;
+    } else { clearInterval(replayTimer); replayTimer=null; }
+  },step);
+}
+
+/* ===== LIVE ===== */
+async function startLive(intv){
+  cleanup();
+  liveMode=true;
+  document.getElementById('modeLabel').innerText='Live';
+  initChart();
+  const hist=await fetchHistoricalData(currentSymbol,intv);
+  replayData=hist.slice(); candleSeries.setData(hist);
+  if(emaPeriod!=='none') emaSeries.setData(ema(replayData,+emaPeriod)); else emaSeries.setData([]);
+  if(smaPeriod!=='none') smaSeries.setData(sma(replayData,+smaPeriod)); else smaSeries.setData([]);
+  if(hist.length) updateInfoBar(hist.at(-1));
+
+  socket=new WebSocket(`wss://stream.binance.com:9443/ws/${currentSymbol.toLowerCase()}@kline_${intv}`);
+  socket.onmessage=evt=>{
+    const data=JSON.parse(evt.data).k;
+    const c={time:Math.floor(data.t/1000),open:+data.o,high:+data.h,low:+data.l,close:+data.c};
+    candleSeries.update(c);
+    const last=replayData.at(-1);
+    if(last && last.time===c.time) replayData[replayData.length-1]=c;
+    else replayData.push(c);
+
+    if(emaPeriod!=='none'){
+      const k2=2/(+emaPeriod+1);
+      lastEMA=lastEMA===null?c.close:c.close*k2 + lastEMA*(1-k2);
+      emaSeries.update({time:c.time,value:lastEMA});
+    }
+    if(smaPeriod!=='none'){
+      const period=+smaPeriod;
+      if(replayData.length>=period){
+        let sum=0;
+        for(let i=replayData.length-period;i<replayData.length;i++) sum+=replayData[i].close;
+        lastSMA=sum/period;
+        smaSeries.update({time:c.time,value:lastSMA});
+      }
+    }
+    updateInfoBar(c);
+  };
+  socket.onclose=()=>setTimeout(()=>{ if(liveMode) startLive(intv); },4000);
+}
+
+/* ===== INFO BAR ===== */
+function updateInfoBar(c){
+  if(!c) return;
+  const price=c.close,open=c.open;
+  const change=price-open;
+  const pct=open?change/open*100:0;
+  const sign=change>=0?'+':'';
+  document.getElementById('lastPrice').innerText=`Fiyat: ${formatPrice(currentSymbol,price)}`;
+  document.getElementById('priceChange').innerHTML=`Değişim: <span class="${change>=0?'up':'down'}">${sign}${formatPrice(currentSymbol,change)} (${sign}${pct.toFixed(2)}%)</span>`;
+}
+
+/* ===== CONTROLS ===== */
+function changeSymbol(s){ currentSymbol=s; if(liveMode) startLive(currentInterval); else startReplay(currentInterval); }
+function changeInterval(i){ currentInterval=i; if(liveMode) startLive(i); else startReplay(i); }
+function toggleMode(){ liveMode=!liveMode; if(liveMode) startLive(currentInterval); else startReplay(currentInterval); }
+function updateReplaySpeed(s){ replaySpeed=+s; if(!liveMode && replayTimer) startReplay(currentInterval); }
+function updateEMA(v){ emaPeriod=v; if(liveMode) startLive(currentInterval); else startReplay(currentInterval); }
+function updateSMA(v){ smaPeriod=v; if(liveMode) startLive(currentInterval); else startReplay(currentInterval); }
+function myButtonFunction(){alert("Xray butonuna tıklandı!");}
+
+/* ===== CLEANUP ===== */
+function cleanup(){
+  if(socket){ try{socket.onclose=null; socket.close();}catch(e){} socket=null; }
+  if(replayTimer){ clearInterval(replayTimer); replayTimer=null; }
+  if(chart){ try{ chart.remove(); }catch(e){} chart=null; candleSeries=emaSeries=smaSeries=null; }
+  lastEMA=null; lastSMA=null;
+}
+
+/* ===== THEME ===== */
+function toggleTheme(){ isLightTheme=!isLightTheme; document.body.classList.toggle("light-theme",isLightTheme); initChart(); }
+
+/* ===== CLOCK ===== */
+function tickClock(){ const now=new Date(); document.getElementById('dateTime').innerText=now.toLocaleDateString('tr-TR')+" "+now.toLocaleTimeString('tr-TR',{hour12:false}); }
+setInterval(tickClock,1000); tickClock();
+
+/* ===== STRATEJİ ===== */
+async function runSelectedStrategy() {
+    const strategyName = document.getElementById('strategySelect').value;
+    try {
+        const module = await import(`./strategies/${strategyName}.js`);
+        module.runStrategy(replayData); // replayData veya canlı veri gönderiliyor
+    } catch (err) {
+        console.error("Strateji yüklenemedi:", err);
+        alert("Strateji yüklenemedi! Konsolu kontrol et.");
+    }
+}
+
+
+/* ===== RESIZE ===== */
+window.addEventListener('resize',()=>{ if(chart) chart.applyOptions({width:window.innerWidth,height:window.innerHeight-100}); });
+
+/* ===== START ===== */
+(async()=>{
+  await fetchTickSizes();
+  startLive(currentInterval);
+})();
+</script>
+</body>
+</html>
